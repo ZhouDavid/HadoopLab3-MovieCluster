@@ -12,17 +12,60 @@ import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 import org.apache.hadoop.util.hash.Hash;
 
-
+import java.util.Map;
+import java.util.Map.Entry;
 import java.io.*;
 import java.util.*;
 
+
 public class GetCanopyCenter {
+    public static Integer canopy_num = 0;
+    public static Vector<HashSet<String>> canopyCenters = new Vector<HashSet<String>>();
+
+    public static class MyOutputFormat extends FileOutputFormat<Text,Text>{
+        @Override
+        public RecordWriter<Text,Text>getRecordWriter(TaskAttemptContext job)
+                throws IOException,InterruptedException{
+            Configuration conf = job.getConfiguration();
+            Path path=getDefaultWorkFile(job,"");
+            FileSystem fs = path.getFileSystem(conf);
+            FSDataOutputStream fout = fs.create(path,false);
+            return new MyWriter(fout);
+        }
+    }
+    public static class MyWriter extends RecordWriter<Text,Text> {
+        protected DataOutputStream out;
+        private String KeyValueSep;
+        public static final String NEW_LINE = "\r\n";
+
+        public MyWriter(DataOutputStream out, String KeyValueSep){
+            this.out = out;
+            this.KeyValueSep = KeyValueSep;
+        }
+        public MyWriter(DataOutputStream out){
+            this(out,"->");
+        }
+
+        @Override
+        public void write(Text title,Text link_list)throws IOException,InterruptedException{
+            if(title!=null){
+                out.write(title.toString().getBytes());
+                out.write(this.KeyValueSep.getBytes());
+            }
+            if(link_list!=null){
+                out.write(link_list.getBytes(),0,link_list.getLength());
+                out.write(NEW_LINE.getBytes());
+            }
+        }
+
+        @Override
+        public void close(TaskAttemptContext context)throws IOException,InterruptedException{
+            out.close();
+        }
+    }
+
     public static class CanopyMapper extends Mapper<Object,Text,Text,Text>{
-        Vector<HashSet<String>> canopyCenters = new Vector<HashSet<String>>();
-        public HashMap<String,Integer>counter = new HashMap<>();
-        public Integer canopy_num = 0;
         int uthreshold = 8;
-        int lthreshold = 2;
         public HashSet<String>genRaterIDs(String r,int begin){
             HashSet<String>ans = new HashSet<>();
             int start = begin;
@@ -35,6 +78,7 @@ public class GetCanopyCenter {
             }
             return ans;
         }
+
         public static int calSimilarity(HashSet<String> s1,HashSet<String>s2){
             int count =0;
             for(Iterator it = s1.iterator();it.hasNext();){
@@ -65,9 +109,6 @@ public class GetCanopyCenter {
                         stronglyMark = true;
                         break;
                     }
-                    else if(share>=lthreshold){
-                        stronglyMark = true;
-                    }
                 }
                 if(stronglyMark == false){
                     canopyCenters.add(rids);
@@ -79,23 +120,107 @@ public class GetCanopyCenter {
     }
 
     public static class CanopyReducer extends Reducer<Text,Text,Text,Text>{
-        public void reduce(Text key,Iterable<Text>values){
+        public HashMap<String,Double>sum=new HashMap<>();
+        @Override
+        public void setup(Context context){
+            System.err.println(canopy_num);
+        }
+        public List cutDimension(HashMap<String,Double>sum){
+            List <Map.Entry<String,Double>> list = new ArrayList<>(sum.entrySet());
+            Collections.sort(list,new Comparator<Map.Entry<String,Double>>(){
+                @Override
+                public int compare(Entry<String,Double>o1,Entry<String,Double>o2){
+                    return o2.getValue().compareTo(o1.getValue());
+                }
+            });
+            return list;
+        }
 
+        public String vec2String(List<Map.Entry<String,Double>>list){
+            String ans = new String();
+            int size = list.size()<20000?list.size():20000;
+            System.err.println("dimension_size="+size);
+            for(int i = 0;i<size;i++){
+                if(i%10000==1)System.err.println(i);
+                ans+=list.get(i).getKey()+":"+list.get(i).getValue()+",";
+            }
+            ans = ans.substring(0,ans.length()-1);
+            return ans;
+        }
+        @Override
+        public void reduce(Text key,Iterable<Text>values,Context context)throws IOException, InterruptedException{
+            System.err.println("reducing.....");
+            double count = 0;
+            sum.clear();
+            for(Text val:values){
+                count++;
+                String vec = val.toString();
+                int start = 0;
+                int end = -1;
+                while((end = vec.indexOf(":",start))!=-1){
+                    String rid = vec.substring(start,end);
+                    start = end+1;
+                    end = vec.indexOf(",",start);
+                    String rate;
+                    boolean is_end = false;
+                    if(end ==-1) {
+                        is_end = true;
+                        rate= vec.substring(start);
+                    }
+                    else rate = vec.substring(start,end);
+                    if(sum.containsKey(rid)){
+                        Double s = sum.get(rid);
+                        Double r = new Double(0);
+                        try{
+                            r = Double.parseDouble(rate);
+                        }
+                        catch(Exception e){
+                            String rrid = rid;
+                            String rr = rate;
+                            System.err.println("rid="+rid+" rate="+rate);
+                            int m =1;
+                        }
+                        s+=r;
+                        sum.put(rid,s);
+                    }
+                    else{
+                        sum.put(rid,Double.parseDouble(rate));
+                    }
+                    if(is_end) break;
+                    start=end+1;
+                }
+            }
+            Iterator it= sum.entrySet().iterator();
+            while(it.hasNext()){
+                Map.Entry entry = (Map.Entry) it.next();
+                String k = (String)entry.getKey();
+                Double s = sum.get(k);
+                s/=count;
+                sum.put(k,s);
+            }
+            //降维
+            List list = cutDimension(sum);
+
+            String vect = vec2String(list);
+            Text vec = new Text(vect);
+            context.write(key,vec);
         }
     }
     public static void main(String args[])throws Exception{
         System.err.println("reading inverted_list....");
         System.err.println("start mapreduce....");
-        String inPath = "E:\\HadoopLab3-MovieCluster\\small_data\\small_reprocessed_data";
-        String outPath = "E:\\HadoopLab3-MovieCluster\\small_data\\small_canopyCenter_data";
+        String inPath = "E:\\HadoopLab3-MovieCluster\\large_data\\large_reprocessed_data\\large_reprocessed_data";
+        String outPath = "E:\\HadoopLab3-MovieCluster\\large_data\\large_canopyCenter_data";
         System.setProperty("hadoop.home.dir","E:\\share\\yarn\\hadoop-2.7.1");
         Configuration conf = new Configuration();
         Job job = Job.getInstance(conf, "get");
         job.setJarByClass(GetCanopyCenter.class);
         job.setMapperClass(CanopyMapper.class);
+        job.setReducerClass(CanopyReducer.class);
         job.setOutputKeyClass(Text.class);
         job.setOutputValueClass(Text.class);
-        job.setNumReduceTasks(0);
+        job.setOutputFormatClass(MyOutputFormat.class);
+        job.setNumReduceTasks(1);
         FileInputFormat.addInputPath(job,new Path(inPath));
         FileOutputFormat.setOutputPath(job,new Path(outPath));
         System.exit(job.waitForCompletion(true)?0:1);
